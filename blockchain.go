@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/gob"
 	"fmt"
 	"math"
 	"math/big"
@@ -168,6 +169,33 @@ func (pow *ProofOfWork) Validate() bool {
 	isValid := hashInt.Cmp(pow.target) == -1
 
 	return isValid
+}
+
+/*
+Serialize a block to store it in the database (BoltDB).
+Keys and values are both byte arrays in BlotDB.
+*/
+func (b *Block) Serialize() []byte {
+	// declare a buffer that will store the serialized data
+	var result bytes.Buffer
+	// initialize a gob encoder
+	encoder := gob.NewEncoder(&result)
+	// encode the block
+	err := encoder.Encode(b)
+	return result.Bytes()
+}
+
+/*
+Deserialize a byte array to a Block.
+*/
+func DeserializeBlock(d []byte) *Block {
+	// declare a block to store the deserialized data
+	var block Block
+	// initialize a gob decoder
+	decoder := gob.NewDecoder(bytes.NewReader(d))
+	// decode the block
+	err := decoder.Decode(&block)
+	return &block
 }
 
 func main() {
