@@ -1,65 +1,22 @@
 package main
 
 import (
-	"bytes"
-	"crypto/sha256"
-	"encoding/binary"
-	"encoding/gob"
-	"fmt"
-	"math"
-	"math/big"
-	"strconv"
-	"time"
+	"github.com/boltdb/bolt"
 )
 
-// The dificulty of mining
-const targetBits = 24
+// DB File to store blockchain information
+const dbFile = "blockchain.db"
 
-// Max nonce to avoid overflow
-const maxNonce = math.MaxInt64
-
-/*
-Block structure with basic information.
-*/
-type Block struct {
-	Timestamp     int64
-	Data          []byte
-	PrevBlockHash []byte
-	Hash          []byte
-	// nonce is required to verify a proof
-	Nonce int
-}
+// Bucket name for storing blocks' information
+const blocksBucket = "blocks"
 
 /*
-Calculating the hashed value for a block.
-Take block fieldsm concatenate them, and calculate a SHA-256 hash
-on the concatenated combination.
-*/
-func (b *Block) SetHash() {
-	timestamp := []byte(strconv.FormatInt(b.Timestamp, 10))
-	headers := bytes.Join([][]byte{b.PrevBlockHash, b.Data, timestamp}, []byte{})
-	hash := sha256.Sum256(headers)
-	b.Hash = hash[:]
-}
-
-/*
-Building a new block and return the pointer.
-*/
-func NewBlock(data string, prevBlockHash []byte) *Block {
-	block := &Block{time.Now().Unix(), []byte(data), prevBlockHash, []byte{}, 0}
-	pow := NewProofOfWork(block)
-
-	nonce, hash := pow.Run()
-	block.Nonce = nonce
-	block.Hash = hash[:]
-	return block
-}
-
-/*
-Blockchain structure as an ordered, back-linked list.
+Blockchain structure.
+Store the tip of the blockchain, and the db connection to the BoltDB.
 */
 type Blockchain struct {
-	blocks []*Block
+	tip []byte
+	db  *bolt.DB
 }
 
 /*
@@ -70,144 +27,98 @@ func NewGenesisBlock() *Block {
 }
 
 /*
-Add blocks to the blockchain
+Add blocks to the blockchain.
+The new Block is stored on DB, and will work as the new tip of the blockchain.
 */
 func (bc *Blockchain) AddBlock(data string) {
-	prevBlock := bc.blocks[len(bc.blocks)-1]
-	newBlock := NewBlock(data, prevBlock.Hash)
-	bc.blocks = append(bc.blocks, newBlock)
+	var lastHash []byte
+
+	// find the last block in the blockchain
+	err := bc.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		lastHash = b.Get([]byte("l"))
+		return nil
+	})
+
+	NewBlock := NewBlock(data, lastHash)
+
+	// add the new block to db, update the tip in blockchain
+	err = bc.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		err := b.Put(NewBlock.Hash, NewBlock.Serialize())
+		err = b.Put([]byte("l"), NewBlock.Hash)
+		bc.tip = NewBlock.Hash
+
+		return nil
+	})
 }
 
 /*
-Create a blockchain
+Create a blockchain.
+First open the DB file.
+Secondly we need to check if there is a blockchain in the DB file.
+
+If there is a blockchain: create a new blockchain instance,
+set the tip of the blockchain to the last block hash stored in the DB.
+
+If there is no blockchain: create the genesis block, store it in the DB,
+save the genesis block's hash as the last block hash,
+create a new blockchain instance with its tip pointing at the genesis block.
 */
 func NewBlockchain() *Blockchain {
-	return &Blockchain{[]*Block{NewGenesisBlock()}}
-}
+	var tip []byte
+	db, err := bolt.Open(dbFile, 0600, nil)
 
-/*
-Proof-of-work algorithum: Hashcash
-First, take some publicly known data(block headers).
-Then add a counter to it. The counter starts at 0.
-Get a hash of the data+counter combination.
-Check that the hash meets certain requirements.
-If it does, we are done, else we need to increase the counter and repeat.
-*/
-type ProofOfWork struct {
-	block  *Block
-	target *big.Int
-}
+	err = db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
 
-func NewProofOfWork(b *Block) *ProofOfWork {
-	target := big.NewInt(1)
-	// Left out the first targetBits 0s
-	// Target is the biggest number meets the requirement.
-	target.Lsh(target, uint(256-targetBits))
-	return &ProofOfWork{b, target}
-}
-
-/*
-Prepare the data to be checked.
-*/
-func (pow *ProofOfWork) prepareData(nonce int) []byte {
-	data := bytes.Join([][]byte{pow.block.PrevBlockHash, pow.block.Data, IntToBytes(pow.block.Timestamp), IntToBytes(int64(targetBits)), IntToBytes(int64(nonce))}, []byte{})
-	return data
-}
-
-func IntToBytes(n int64) []byte {
-	// Create a buffer to hold the binary representation
-	buf := make([]byte, binary.MaxVarintLen64)
-
-	// Encode the integer into the buffer
-	binary.PutVarint(buf, n)
-
-	// Trim any unused bytes from the buffer and return it
-	return buf[:binary.Size(n)]
-}
-
-/*
-Run the proof-of-work algorithm on the block to be checked.
-*/
-func (pow *ProofOfWork) Run() (int, []byte) {
-	var hashInt big.Int
-	var hash [32]byte
-	nonce := 0
-
-	fmt.Printf("Mining the block containing \"%s\"\n", pow.block.Data)
-	for nonce < maxNonce {
-		// prepare data
-		data := pow.prepareData(nonce)
-		// hash it with SHA-256
-		hash = sha256.Sum256(data)
-		fmt.Printf("\r%x", hash)
-		// convert the hash to a big integer
-		hashInt.SetBytes((hash[:]))
-		// compare the integer with the target
-		if hashInt.Cmp(pow.target) == -1 {
-			break
+		if b == nil {
+			genesis := NewGenesisBlock()
+			b, err := tx.CreateBucket([]byte(blocksBucket))
+			err = b.Put(genesis.Hash, genesis.Serialize())
+			err = b.Put([]byte("l"), genesis.Hash)
+			tip = genesis.Hash
 		} else {
-			nonce++
+			tip = b.Get([]byte("l"))
 		}
-	}
+		return nil
+	})
 
-	fmt.Print("\n\n")
+	bc := Blockchain{tip, db}
 
-	// return iteration number nonce, and the hash it has
-	return nonce, hash[:]
+	return &bc
 }
 
-/*
-Validate prood of works
-Check for the stored nonce, valid if the hash is smaller than the stored target
-*/
-func (pow *ProofOfWork) Validate() bool {
-	var hashInt big.Int
-	data := pow.prepareData(pow.block.Nonce)
-	hash := sha256.Sum256(data)
-	hashInt.SetBytes(hash[:])
-
-	isValid := hashInt.Cmp(pow.target) == -1
-
-	return isValid
+// iterator
+type BlockchainIterator struct {
+	currentHash []byte
+	db          *bolt.DB
 }
 
-/*
-Serialize a block to store it in the database (BoltDB).
-Keys and values are both byte arrays in BlotDB.
-*/
-func (b *Block) Serialize() []byte {
-	// declare a buffer that will store the serialized data
-	var result bytes.Buffer
-	// initialize a gob encoder
-	encoder := gob.NewEncoder(&result)
-	// encode the block
-	err := encoder.Encode(b)
-	return result.Bytes()
+func (bc *Blockchain) Iterator() *BlockchainIterator {
+	bci := BlockchainIterator{bc.tip, bc.db}
+	return &bci
 }
 
-/*
-Deserialize a byte array to a Block.
-*/
-func DeserializeBlock(d []byte) *Block {
-	// declare a block to store the deserialized data
-	var block Block
-	// initialize a gob decoder
-	decoder := gob.NewDecoder(bytes.NewReader(d))
-	// decode the block
-	err := decoder.Decode(&block)
-	return &block
+func (bci *BlockchainIterator) Next() *Block {
+	var block *Block
+
+	err := bci.db.View(func(tx *bolt.Tx) error {
+		bc := tx.Bucket([]byte(blocksBucket))
+		encodedBlock := bc.Get(bci.currentHash)
+		block = DeserializeBlock(encodedBlock)
+		return nil
+	})
+
+	bci.currentHash = block.PrevBlockHash
+	return block
 }
 
 func main() {
 	bc := NewBlockchain()
-	bc.AddBlock("Send 1 BTC to Amy")
-	bc.AddBlock("Send 2 more BTC to Amy")
+	defer bc.db.Close()
 
-	for _, block := range bc.blocks {
-		fmt.Printf("Prev.hash: %x\n", block.PrevBlockHash)
-		fmt.Printf("Data: %s\n", block.Data)
-		fmt.Printf("Hash: %x\n", block.Hash)
-		pow := NewProofOfWork(block)
-		fmt.Printf("PoW: %s\n", strconv.FormatBool(pow.Validate()))
-	}
+	cli := CLI{bc}
+	cli.Run()
+
 }
